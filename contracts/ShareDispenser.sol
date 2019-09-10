@@ -53,11 +53,13 @@ interface ERC20 {
     function balanceOf(address owner) external view returns (uint256 balance);
 }
 
+
 contract ShareDispenser is Ownable, Pausable {
     constructor(
         address initialXCHFContractAddress,
         address initialDSHSContractAddress,
-        address initialusageFeeAddress
+        address initialusageFeeAddress,
+        address initialBackendAddress
         ) public {
 
         require(initialXCHFContractAddress != address(0), "XCHF does not reside at address 0!");
@@ -67,6 +69,7 @@ contract ShareDispenser is Ownable, Pausable {
         XCHFContractAddress = initialXCHFContractAddress;
         DSHSContractAddress = initialDSHSContractAddress;
         usageFeeAddress = initialusageFeeAddress;
+        backendAddress = initialBackendAddress;
     }
 
     /*
@@ -86,6 +89,7 @@ contract ShareDispenser is Ownable, Pausable {
     address public XCHFContractAddress;     // Address where XCHF is deployed
     address public DSHSContractAddress;     // Address where DSHS is deployed
     address public usageFeeAddress;         // Address where usage fee is collected
+    address public backendAddress;          // Address used by backend server (triggers buy/sell)
 
     uint256 public usageFeeBSP  = 90;       // 0.9% usage fee (10000 basis points = 100%)
     uint256 public minVolume = 1;          // Minimum number of shares to buy/sell
@@ -103,7 +107,7 @@ contract ShareDispenser is Ownable, Pausable {
     event DSHSContractAddressSet(address newDSHSContractAddress);
     event UsageFeeAddressSet(address newUsageFeeAddress);
 
-    event SharesPurchased(address indexed buyer, uint256 amount, uint256 totalPrice, uint256 nextPrice);
+    event SharesPurchased(address indexed buyer, uint256 amount, uint256 price, uint256 nextPrice);
     event SharesSold(address indexed seller, uint256 amount, uint256 buyBackPrice, uint256 nextPrice);
 
     event TokensRetrieved(address contractAddress, address indexed to, uint256 amount);
@@ -120,25 +124,27 @@ contract ShareDispenser is Ownable, Pausable {
 
     // Function for buying shares
 
-    function buyShares(uint256 numberOfSharesToBuy) public whenNotPaused() returns (bool) {
+    function buyShares(address buyer, uint256 numberOfSharesToBuy) public whenNotPaused() returns (bool) {
 
         // Check that buying is enabled
         require(buyEnabled, "Buying is currenty disabled");
         require(numberOfSharesToBuy >= minVolume, "Volume too low");
 
-        // Fetch the total price
-        address buyer = msg.sender;
-        uint256 sharesAvailable = getERC20Balance(DSHSContractAddress);
-        uint256 totalPrice = getCumulatedPrice(numberOfSharesToBuy, sharesAvailable);
+        // Check user is allowed to trigger buy
+        require(msg.sender == buyer || msg.sender == backendAddress, "You do not have permission to trigger buying shares for someone else.");
 
-        // Check that there are enough shares
+        // Fetch the price (excluding the usage fee)
+        uint256 sharesAvailable = getERC20Balance(DSHSContractAddress);
+        uint256 price = getCumulatedPrice(numberOfSharesToBuy, sharesAvailable);
+
+        // Check that there are enough shares available
         require(sharesAvailable >= numberOfSharesToBuy, "Not enough shares available");
 
        // Compute usage fee
-        uint256 usageFee = totalPrice.mul(usageFeeBSP).div(10000);
+        uint256 usageFee = price.mul(usageFeeBSP).div(10000);
 
-        // Check that XCHF balance is sufficient and allowance is set
-        require(getERC20Available(XCHFContractAddress, buyer) >= totalPrice.add(usageFee), "Payment not authorized or funds insufficient");
+        // Check that allowance is set XCHF balance is sufficient to cover price + usage fee
+        require(getERC20Available(XCHFContractAddress, buyer) >= price.add(usageFee), "Payment not authorized or funds insufficient");
 
         // Instantiate contracts
         ERC20 DSHS = ERC20(DSHSContractAddress);
@@ -146,36 +152,35 @@ contract ShareDispenser is Ownable, Pausable {
 
         // Transfer usage fee and total price
         require(XCHF.transferFrom(buyer, usageFeeAddress, usageFee), "Usage fee transfer failed");
-        require(XCHF.transferFrom(buyer, address(this), totalPrice), "XCHF payment failed");
+        require(XCHF.transferFrom(buyer, address(this), price), "XCHF payment failed");
 
         // Transfer the shares
         require(DSHS.transfer(buyer, numberOfSharesToBuy), "Share transfer failed");
         uint256 nextPrice = getCumulatedPrice(1, sharesAvailable.sub(numberOfSharesToBuy));
-        emit SharesPurchased(buyer, numberOfSharesToBuy, totalPrice, nextPrice);
+        emit SharesPurchased(buyer, numberOfSharesToBuy, price, nextPrice);
         return true;
     }
 
     // Function for selling shares
 
-    function sellShares(uint256 numberOfSharesToSell, uint256 limitInXCHF) public whenNotPaused() returns (bool) {
+    function sellShares(address seller, uint256 numberOfSharesToSell, uint256 limitInXCHF) public whenNotPaused() returns (bool) {
 
         // Check that selling is enabled
         require(sellEnabled, "Selling is currenty disabled");
         require(numberOfSharesToSell >= minVolume, "Volume too low");
 
-        // Fetch buyback price
-        address seller = msg.sender;
+        // Check user is allowed to trigger sale;
+        require(msg.sender == buyer || msg.sender == backendAddress, "You do not have permission to trigger selling shares for someone else.");
+
         uint256 XCHFAvailable = getERC20Balance(XCHFContractAddress);
         uint256 sharesAvailable = getERC20Balance(DSHSContractAddress);
 
-        uint256 buyBackPrice = getCumulatedBuyBackPrice(numberOfSharesToSell, sharesAvailable);
-        require(limitInXCHF <= buyBackPrice, "Price too low");
-
-        // Compute usage fee
-        uint256 usageFee = buyBackPrice.mul(usageFeeBSP).div(10000);
+        // The full price. The usage fee is deducted from this to obtain the seller's payout
+        uint256 price = getCumulatedBuyBackPrice(numberOfSharesToSell, sharesAvailable);
+        require(limitInXCHF <= price, "Price too low");
 
         // Check that XCHF reserve is sufficient
-        require(XCHFAvailable >= buyBackPrice, "Reserves to small to buy back this amount of shares");
+        require(XCHFAvailable >= price, "Reserves to small to buy back this amount of shares");
 
         // Check that seller has sufficient shares and allowance is set
         require(getERC20Available(DSHSContractAddress, seller) >= numberOfSharesToSell, "Seller doesn't have enough shares");
@@ -187,11 +192,14 @@ contract ShareDispenser is Ownable, Pausable {
         // Transfer the shares
         require(DSHS.transferFrom(seller, address(this), numberOfSharesToSell), "Share transfer failed");
 
+        // Compute usage fee
+        uint256 usageFee = price.mul(usageFeeBSP).div(10000);
+
         // Transfer usage fee and buyback price
         require(XCHF.transfer(usageFeeAddress, usageFee), "Usage fee transfer failed");
-        require(XCHF.transfer(seller, buyBackPrice.sub(usageFee)), "XCHF payment failed");
+        require(XCHF.transfer(seller, price.sub(usageFee)), "XCHF payment failed");
         uint256 nextPrice = getCumulatedBuyBackPrice(1, sharesAvailable.add(numberOfSharesToSell));
-        emit SharesSold(seller, numberOfSharesToSell, buyBackPrice, nextPrice);
+        emit SharesSold(seller, numberOfSharesToSell, price, nextPrice);
         return true;
     }
 
@@ -211,19 +219,15 @@ contract ShareDispenser is Ownable, Pausable {
 
     // Price getters
 
-    function getCumulatedPrice(uint256 amount, uint256 supply) public view returns (uint256){
+    function getCumulatedPrice(uint256 amount, uint256 supply) public view returns (uint256) {
         uint256 cumulatedPrice = 0;
         if (supply <= initialNumberOfShares) {
             uint256 first = initialNumberOfShares.add(1).sub(supply);
             uint256 last = first.add(amount).sub(1);
             cumulatedPrice = helper(first, last);
-        }
-
-        else if (supply.sub(amount) >= initialNumberOfShares) {
+        } else if (supply.sub(amount) >= initialNumberOfShares) {
             cumulatedPrice = minPriceInXCHF.mul(amount);
-        }
-
-        else {
+        } else {
             cumulatedPrice = supply.sub(initialNumberOfShares).mul(minPriceInXCHF);
             uint256 first = 1;
             uint256 last = amount.sub(supply.sub(initialNumberOfShares));
@@ -233,7 +237,7 @@ contract ShareDispenser is Ownable, Pausable {
         return cumulatedPrice;
     }
 
-    function getCumulatedBuyBackPrice(uint256 amount, uint256 supply) public view returns (uint256){
+    function getCumulatedBuyBackPrice(uint256 amount, uint256 supply) public view returns (uint256) {
         return getCumulatedPrice(amount, supply.add(amount)); // For symmetry reasons
     }
 
@@ -265,6 +269,10 @@ contract ShareDispenser is Ownable, Pausable {
         require(newUsageFeeAddress != address(0), "DSHS does not reside at address 0");
         usageFeeAddress = newUsageFeeAddress;
         emit UsageFeeAddressSet(usageFeeAddress);
+    }
+
+    function setBackendAddress(address newBackendAddress) public onlyOwner() {
+        backendAddress = newBackendAddress;
     }
 
     // Setters for constants
