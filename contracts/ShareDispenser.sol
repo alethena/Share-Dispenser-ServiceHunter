@@ -1,23 +1,47 @@
-pragma solidity 0.5.0;
+/**
+* MIT License with Automated License Fee Payments
+*
+* Copyright (c) 2019 Equility AG (alethena.com)
+*
+* Permission is hereby granted to any person obtaining a copy of this software
+* and associated documentation files (the "Software"), to deal in the Software
+* without restriction, including without limitation the rights to use, copy,
+* modify, merge, publish, distribute, sublicense, and/or sell copies of the
+* Software, and to permit persons to whom the Software is furnished to do so,
+* subject to the following conditions:
+*
+* - The above copyright notice and this permission notice shall be included in
+*   all copies or substantial portions of the Software.
+* - All automated license fee payments integrated into this and related Software
+*   are preserved.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+* AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+* OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+* SOFTWARE.
+*/
+pragma solidity 0.5.10;
 
 import "../node_modules/openzeppelin-solidity/contracts/ownership/Ownable.sol";
 import "../node_modules/openzeppelin-solidity/contracts/math/SafeMath.sol";
 import "../node_modules/openzeppelin-solidity/contracts/lifecycle/Pausable.sol";
 
 /**
- * @title Alethena Share Dispenser
+ * @title Alethena Share Dispenser for Draggable ServiceHunter Shares (DSHS)
  * @author Benjamin Rickenbacher, benjamin@alethena.com
  * @dev This contract uses the open-zeppelin library.
  *
- * This smart contract is intended to serve as a tool that companies can use to provide liquidity in the context of 
- * shares not traded on an exchange. This concrete instance is used to by Alethena for the tokenised shares of the 
- * underlying Equility AG (https://etherscan.io/token/0xf40c5e190a608b6f8c0bf2b38c9506b327941402).
+ * This smart contract is intended to serve as a tool that ServiceHunter AG can use to
+ * provide liquidity for their DSHS.
  *
- * The currency used for payment is the Crypto Franc XCHF (https://www.swisscryptotokens.ch/) which makes it possible
- * to quote share prices directly in Swiss Francs.
+ * The currency used for payment is the Crypto Franc XCHF (https://www.swisscryptotokens.ch/)
+ * which makes it possible to quote DSHS prices directly in Swiss Francs.
  *
- * A company can allocate a certain number of shares (and optionally also some XCHF) to the share dispenser 
- * and defines a linear price dependency.
+ * ServiceHunter AG can allocate a certain number of DSHS and (optionally) also some XCHF
+ * to the Share Dispenser and defines a linear price dependency.
  **/
 
 interface ERC20 {
@@ -31,60 +55,57 @@ interface ERC20 {
 
 contract ShareDispenser is Ownable, Pausable {
     constructor(
-        address initialXCHFContractAddress, 
-        address initialALEQContractAddress, 
+        address initialXCHFContractAddress,
+        address initialDSHSContractAddress,
         address initialusageFeeAddress
         ) public {
-            
+
         require(initialXCHFContractAddress != address(0), "XCHF does not reside at address 0!");
-        require(initialALEQContractAddress != address(0), "ALEQ does not reside at address 0!");
+        require(initialDSHSContractAddress != address(0), "DSHS does not reside at address 0!");
         require(initialusageFeeAddress != address(0), "Usage fee address cannot be 0!");
 
         XCHFContractAddress = initialXCHFContractAddress;
-        ALEQContractAddress = initialALEQContractAddress;
+        DSHSContractAddress = initialDSHSContractAddress;
         usageFeeAddress = initialusageFeeAddress;
     }
 
-    /* 
+    /*
      * Fallback function to prevent accidentally sending Ether to the contract
      * It is still possible to force Ether into the contract as this cannot be prevented fully.
      * Sending Ether to this contract does not create any problems for the contract, but the Ether will be lost.
-    */ 
+    */
 
     function () external payable {
-        revert("This contract does not accept Ether."); 
-    }   
+        revert("This contract does not accept Ether.");
+    }
 
     using SafeMath for uint256;
 
     // Variables
 
     address public XCHFContractAddress;     // Address where XCHF is deployed
-    address public ALEQContractAddress;     // Address where ALEQ is deployed
+    address public DSHSContractAddress;     // Address where DSHS is deployed
     address public usageFeeAddress;         // Address where usage fee is collected
 
-    // Buy and sell always refer to the end-user view.
-    // 10000 basis points = 100%
+    uint256 public usageFeeBSP  = 90;       // 0.9% usage fee (10000 basis points = 100%)
+    uint256 public minVolume = 1;          // Minimum number of shares to buy/sell
 
-    uint256 public usageFeeBSP  = 0;       // In basis points. 0 = no usage fee
-    uint256 public minVolume = 20;          // Minimum number of shares to buy/sell
-
-    uint256 public minPriceInXCHF = 6*10**18;
-    uint256 public maxPriceInXCHF = 65*10**17;
-    uint256 public initialNumberOfShares = 2000;
+    uint256 public minPriceInXCHF = 300*10**18; // Minimum price
+    uint256 public maxPriceInXCHF = 350*10**18; // Maximum price
+    uint256 public initialNumberOfShares = 2000; //Price slope (TBD)
 
     bool public buyEnabled = true;
-    bool public sellEnabled = false;
+    bool public sellEnabled = true;
 
-    // Events 
+    // Events
 
     event XCHFContractAddressSet(address newXCHFContractAddress);
-    event ALEQContractAddressSet(address newALEQContractAddress);
+    event DSHSContractAddressSet(address newDSHSContractAddress);
     event UsageFeeAddressSet(address newUsageFeeAddress);
 
     event SharesPurchased(address indexed buyer, uint256 amount, uint256 totalPrice, uint256 nextPrice);
     event SharesSold(address indexed seller, uint256 amount, uint256 buyBackPrice, uint256 nextPrice);
-    
+
     event TokensRetrieved(address contractAddress, address indexed to, uint256 amount);
 
     event UsageFeeSet(uint256 usageFee);
@@ -95,7 +116,7 @@ contract ShareDispenser is Ownable, Pausable {
 
     event BuyStatusChanged(bool newStatus);
     event SellStatusChanged(bool newStatus);
-    
+
 
     // Function for buying shares
 
@@ -107,29 +128,28 @@ contract ShareDispenser is Ownable, Pausable {
 
         // Fetch the total price
         address buyer = msg.sender;
-        uint256 sharesAvailable = getERC20Balance(ALEQContractAddress);
+        uint256 sharesAvailable = getERC20Balance(DSHSContractAddress);
         uint256 totalPrice = getCumulatedPrice(numberOfSharesToBuy, sharesAvailable);
 
         // Check that there are enough shares
         require(sharesAvailable >= numberOfSharesToBuy, "Not enough shares available");
 
-        //Check that XCHF balance is sufficient and allowance is set
-        require(getERC20Available(XCHFContractAddress, buyer) >= totalPrice, "Payment not authorized or funds insufficient");
-
-        // Compute usage fee and final payment amount
+       // Compute usage fee
         uint256 usageFee = totalPrice.mul(usageFeeBSP).div(10000);
-        uint256 paymentAmount = totalPrice.sub(usageFee);
+
+        // Check that XCHF balance is sufficient and allowance is set
+        require(getERC20Available(XCHFContractAddress, buyer) >= totalPrice.add(usageFee), "Payment not authorized or funds insufficient");
 
         // Instantiate contracts
-        ERC20 ALEQ = ERC20(ALEQContractAddress);
+        ERC20 DSHS = ERC20(DSHSContractAddress);
         ERC20 XCHF = ERC20(XCHFContractAddress);
 
-        // Transfer usage fee and payment amount
+        // Transfer usage fee and total price
         require(XCHF.transferFrom(buyer, usageFeeAddress, usageFee), "Usage fee transfer failed");
-        require(XCHF.transferFrom(buyer, address(this), paymentAmount), "XCHF payment failed");
+        require(XCHF.transferFrom(buyer, address(this), totalPrice), "XCHF payment failed");
 
         // Transfer the shares
-        require(ALEQ.transfer(buyer, numberOfSharesToBuy), "Share transfer failed");
+        require(DSHS.transfer(buyer, numberOfSharesToBuy), "Share transfer failed");
         uint256 nextPrice = getCumulatedPrice(1, sharesAvailable.sub(numberOfSharesToBuy));
         emit SharesPurchased(buyer, numberOfSharesToBuy, totalPrice, nextPrice);
         return true;
@@ -146,31 +166,30 @@ contract ShareDispenser is Ownable, Pausable {
         // Fetch buyback price
         address seller = msg.sender;
         uint256 XCHFAvailable = getERC20Balance(XCHFContractAddress);
-        uint256 sharesAvailable = getERC20Balance(ALEQContractAddress);
+        uint256 sharesAvailable = getERC20Balance(DSHSContractAddress);
 
         uint256 buyBackPrice = getCumulatedBuyBackPrice(numberOfSharesToSell, sharesAvailable);
         require(limitInXCHF <= buyBackPrice, "Price too low");
+
+        // Compute usage fee
+        uint256 usageFee = buyBackPrice.mul(usageFeeBSP).div(10000);
 
         // Check that XCHF reserve is sufficient
         require(XCHFAvailable >= buyBackPrice, "Reserves to small to buy back this amount of shares");
 
         // Check that seller has sufficient shares and allowance is set
-        require(getERC20Available(ALEQContractAddress, seller) >= numberOfSharesToSell, "Seller doesn't have enough shares");
-
-        // Compute usage fee and final payment amount
-        uint256 usageFee = buyBackPrice.mul(usageFeeBSP).div(10000);
-        uint256 paymentAmount = buyBackPrice.sub(usageFee);
+        require(getERC20Available(DSHSContractAddress, seller) >= numberOfSharesToSell, "Seller doesn't have enough shares");
 
         // Instantiate contracts
-        ERC20 ALEQ = ERC20(ALEQContractAddress);
+        ERC20 DSHS = ERC20(DSHSContractAddress);
         ERC20 XCHF = ERC20(XCHFContractAddress);
 
         // Transfer the shares
-        require(ALEQ.transferFrom(seller, address(this), numberOfSharesToSell), "Share transfer failed");
+        require(DSHS.transferFrom(seller, address(this), numberOfSharesToSell), "Share transfer failed");
 
-        // Transfer usage fee and payment amount
+        // Transfer usage fee and buyback price
         require(XCHF.transfer(usageFeeAddress, usageFee), "Usage fee transfer failed");
-        require(XCHF.transfer(seller, paymentAmount), "XCHF payment failed");
+        require(XCHF.transfer(seller, buyBackPrice.sub(usageFee)), "XCHF payment failed");
         uint256 nextPrice = getCumulatedBuyBackPrice(1, sharesAvailable.add(numberOfSharesToSell));
         emit SharesSold(seller, numberOfSharesToSell, buyBackPrice, nextPrice);
         return true;
@@ -210,7 +229,7 @@ contract ShareDispenser is Ownable, Pausable {
             uint256 last = amount.sub(supply.sub(initialNumberOfShares));
             cumulatedPrice = cumulatedPrice.add(helper(first,last));
         }
-        
+
         return cumulatedPrice;
     }
 
@@ -218,7 +237,7 @@ contract ShareDispenser is Ownable, Pausable {
         return getCumulatedPrice(amount, supply.add(amount)); // For symmetry reasons
     }
 
-    // Function to retrieve ALEQ or XCHF from contract
+    // Function to retrieve DSHS or XCHF from contract
     // This can also be used to retrieve any other ERC-20 token sent to the smart contract by accident
 
     function retrieveERC20(address contractAddress, address to, uint256 amount) public onlyOwner() returns(bool) {
@@ -236,20 +255,20 @@ contract ShareDispenser is Ownable, Pausable {
         emit XCHFContractAddressSet(XCHFContractAddress);
     }
 
-    function setALEQContractAddress(address newALEQContractAddress) public onlyOwner() {
-        require(newALEQContractAddress != address(0), "ALEQ does not reside at address 0");
-        ALEQContractAddress = newALEQContractAddress;
-        emit ALEQContractAddressSet(ALEQContractAddress);
+    function setDSHSContractAddress(address newDSHSContractAddress) public onlyOwner() {
+        require(newDSHSContractAddress != address(0), "DSHS does not reside at address 0");
+        DSHSContractAddress = newDSHSContractAddress;
+        emit DSHSContractAddressSet(DSHSContractAddress);
     }
 
     function setUsageFeeAddress(address newUsageFeeAddress) public onlyOwner() {
-        require(newUsageFeeAddress != address(0), "ALEQ does not reside at address 0");
+        require(newUsageFeeAddress != address(0), "DSHS does not reside at address 0");
         usageFeeAddress = newUsageFeeAddress;
         emit UsageFeeAddressSet(usageFeeAddress);
     }
 
     // Setters for constants
-    
+
     function setUsageFee(uint256 newUsageFeeInBSP) public onlyOwner() {
         require(newUsageFeeInBSP <= 10000, "Usage fee must be given in basis points");
         usageFeeBSP = newUsageFeeInBSP;
