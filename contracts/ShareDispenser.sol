@@ -170,7 +170,7 @@ contract ShareDispenser is Ownable, Pausable {
         require(numberOfSharesToSell >= minVolume, "Volume too low");
 
         // Check user is allowed to trigger sale;
-        require(msg.sender == buyer || msg.sender == backendAddress, "You do not have permission to trigger selling shares for someone else.");
+        require(msg.sender == seller || msg.sender == backendAddress, "You do not have permission to trigger selling shares for someone else.");
 
         uint256 XCHFAvailable = getERC20Balance(XCHFContractAddress);
         uint256 sharesAvailable = getERC20Balance(DSHSContractAddress);
